@@ -6,10 +6,11 @@ if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* ]]; then
 fi
 
 REGION="us-east-1"
-# GPU lane: g4dn.xlarge provides the CUDA-capable NVIDIA T4 needed for vLLM; stage 1
-# checks its 4-vCPU quota and live hourly price before launch to keep the choice budget-aware.
+export AWS_DEFAULT_REGION="$REGION"
+# I went with the GPU lane. vLLM needs CUDA, and g4dn.xlarge has a T4 and 4 vCPUs,
+# which is exactly my approved quota. Stage 1 checks the quota and live price first.
 INSTANCE_TYPE="g4dn.xlarge"
-# Model choice: the 0.5B model fits comfortably on the T4 and keeps startup/download time small.
+# Smallest Qwen model, so it fits easily on the T4 and downloads quickly.
 MODEL="Qwen/Qwen2.5-0.5B-Instruct"
 PROJECT_TAG="opencsusm"
 KEY_NAME="opencsusm-key"
@@ -39,7 +40,7 @@ load_state() {
 }
 
 get_instance_host() {
-  aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+  aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
     --query 'Reservations[0].Instances[0].PublicIpAddress' --output text
 }
 
@@ -68,7 +69,7 @@ case "$1" in
     command -v python3 >/dev/null || { echo "Python 3 is required to parse live AWS pricing." >&2; exit 1; }
 
     QUOTA="$(aws service-quotas get-service-quota --service-code ec2 \
-      --quota-code L-DB2E81BA --region "$REGION" \
+      --quota-code L-DB2E81BA \
       --query 'Quota.Value' --output text)"
     QUOTA_WHOLE="${QUOTA%%.*}"
     if [[ ! "$QUOTA_WHOLE" =~ ^[0-9]+$ ]] || (( QUOTA_WHOLE < 4 )); then
@@ -78,7 +79,7 @@ case "$1" in
     fi
     printf 'Running On-Demand G/VT quota: %s vCPUs (%s requires 4).\n' "$QUOTA" "$INSTANCE_TYPE"
 
-    PRICE_JSON="$(aws pricing get-products --region us-east-1 --service-code AmazonEC2 \
+    PRICE_JSON="$(aws pricing get-products --service-code AmazonEC2 \
       --filters "Type=TERM_MATCH,Field=instanceType,Value=$INSTANCE_TYPE" \
         'Type=TERM_MATCH,Field=location,Value=US East (N. Virginia)' \
         'Type=TERM_MATCH,Field=operatingSystem,Value=Linux' \
@@ -114,25 +115,25 @@ print(prices[0])
         echo "Could not determine your public IPv4 address." >&2
         exit 1
       }
-      VPC_ID="$(aws ec2 describe-vpcs --region "$REGION" \
+      VPC_ID="$(aws ec2 describe-vpcs \
         --filters Name=isDefault,Values=true --query 'Vpcs[0].VpcId' --output text)"
       [[ -n "$VPC_ID" && "$VPC_ID" != "None" ]] || {
         echo "No default VPC found in $REGION." >&2
         exit 1
       }
-      AMI_ID="$(aws ssm get-parameter --region "$REGION" --name "$AMI_PARAMETER" \
+      AMI_ID="$(aws ssm get-parameter --name "$AMI_PARAMETER" \
         --query 'Parameter.Value' --output text)"
       umask 077
-      aws ec2 create-key-pair --region "$REGION" --key-name "$KEY_NAME" \
+      aws ec2 create-key-pair --key-name "$KEY_NAME" \
         --query KeyMaterial --output text > "$KEY_FILE"
-      SG_ID="$(aws ec2 create-security-group --region "$REGION" --group-name "$SG_NAME" \
-        --description 'SSH from my IP only; inference is available through an SSH tunnel' \
+      SG_ID="$(aws ec2 create-security-group --group-name "$SG_NAME" \
+        --description 'SSH from my IP only, model is reached through a tunnel' \
         --vpc-id "$VPC_ID" --query GroupId --output text)"
-      aws ec2 create-tags --region "$REGION" --resources "$SG_ID" \
+      aws ec2 create-tags --resources "$SG_ID" \
         --tags "Key=Project,Value=$PROJECT_TAG" "Key=Name,Value=$SG_NAME"
-      aws ec2 authorize-security-group-ingress --region "$REGION" --group-id "$SG_ID" \
+      aws ec2 authorize-security-group-ingress --group-id "$SG_ID" \
         --protocol tcp --port 22 --cidr "$MY_IP/32" >/dev/null
-      INSTANCE_ID="$(aws ec2 run-instances --region "$REGION" --image-id "$AMI_ID" \
+      INSTANCE_ID="$(aws ec2 run-instances --image-id "$AMI_ID" \
         --instance-type "$INSTANCE_TYPE" --key-name "$KEY_NAME" \
         --security-group-ids "$SG_ID" \
         --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=80,VolumeType=gp3}' \
@@ -142,7 +143,7 @@ print(prices[0])
         --query 'Instances[0].InstanceId' --output text)"
       printf '%s %s %s\n' "$INSTANCE_ID" "$SG_ID" "$KEY_NAME" > "$STATE_FILE"
       chmod 600 "$STATE_FILE"
-      aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID"
+      aws ec2 wait instance-running --instance-ids "$INSTANCE_ID"
       SSH_HOST="$(get_instance_host)"
       printf 'Launched %s (%s).\n' "$INSTANCE_ID" "$SSH_HOST"
     fi
@@ -155,7 +156,7 @@ print(prices[0])
     wait_for_ssh "$SSH_HOST"
     ssh -i "$KEY_FILE" -o StrictHostKeyChecking=accept-new "ubuntu@$SSH_HOST" 'sudo bash -s' <<'REMOTE_INSTALL'
 set -euo pipefail
-  systemctl stop vllm 2>/dev/null || true
+systemctl stop vllm 2>/dev/null || true
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y python3-venv python3-pip curl
@@ -227,36 +228,12 @@ REMOTE_SERVE
       -H 'Content-Type: application/json' \
       -d '{"model":"Qwen/Qwen2.5-0.5B-Instruct","messages":[{"role":"user","content":"I am John"}],"max_tokens":20,"temperature":0}')"
     printf '%s\n' "$RESPONSE"
-    #evidence: $ bash opencsusm.sh 6
-    #{
-    #  "id": "chatcmpl-caddb4996de54535a05dfd1ea5c0d35c",
-    #  "object": "chat.completion",
-    #  "created": 1791774039,
-    #  "model": "Qwen/Qwen2.5-0.5B-Instruct",
-    #  "choices": [
-    #    {
-    #      "index": 0,
-    #      "message": {
-    #        "role": "assistant",
-    #        "content": "Hello John! It's nice to meet you. As a language model, I don't have personal"
-    #      },
-    #      "tool_calls": []
-    #    }
-    #  ],
-    #  "usage": {
-    #    "prompt_tokens": 32,
-    #    "total_tokens": 52,
-    #    "completion_tokens": 20,
-    #    "prompt_tokens_details": null
-    #  },
-    #  "prompt_logprobs": null
-    #}
     ;;
   7)
     require_aws
     load_state
-    aws ec2 stop-instances --region "$REGION" --instance-ids "$INSTANCE_ID" >/dev/null
-    aws ec2 wait instance-stopped --region "$REGION" --instance-ids "$INSTANCE_ID"
+    aws ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
+    aws ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
     echo "Instance stopped. Compute is off; EBS storage continues to incur charges."
     ;;
   8)
@@ -268,7 +245,7 @@ REMOTE_SERVE
     fi
 
     INSTANCE_IDS=()
-    TAGGED_INSTANCES="$(aws ec2 describe-instances --region "$REGION" \
+    TAGGED_INSTANCES="$(aws ec2 describe-instances \
       --filters "Name=tag:Project,Values=$PROJECT_TAG" \
         Name=instance-state-name,Values=pending,running,stopping,stopped \
       --query 'Reservations[].Instances[].InstanceId' --output text)"
@@ -281,13 +258,13 @@ REMOTE_SERVE
 
     VOLUME_IDS=()
     for id in "${INSTANCE_IDS[@]}"; do
-      volumes="$(aws ec2 describe-instances --region "$REGION" --instance-ids "$id" \
+      volumes="$(aws ec2 describe-instances --instance-ids "$id" \
         --query 'Reservations[].Instances[].BlockDeviceMappings[].Ebs.VolumeId' --output text 2>/dev/null || true)"
       while IFS= read -r volume_id; do
         [[ -n "$volume_id" && "$volume_id" != "None" ]] && VOLUME_IDS+=("$volume_id")
       done < <(printf '%s\n' "$volumes" | tr '\t' '\n')
     done
-    TAGGED_VOLUMES="$(aws ec2 describe-volumes --region "$REGION" \
+    TAGGED_VOLUMES="$(aws ec2 describe-volumes \
       --filters "Name=tag:Project,Values=$PROJECT_TAG" \
       --query 'Volumes[].VolumeId' --output text)"
     while IFS= read -r volume_id; do
@@ -295,7 +272,7 @@ REMOTE_SERVE
     done < <(printf '%s\n' "$TAGGED_VOLUMES" | tr '\t' '\n')
 
     SG_IDS=()
-    TAGGED_SGS="$(aws ec2 describe-security-groups --region "$REGION" \
+    TAGGED_SGS="$(aws ec2 describe-security-groups \
       --filters "Name=tag:Project,Values=$PROJECT_TAG" \
       --query 'SecurityGroups[].GroupId' --output text)"
     while IFS= read -r group_id; do
@@ -309,10 +286,10 @@ REMOTE_SERVE
       [[ -n "${SEEN[$id]:-}" ]] || { SEEN[$id]=1; UNIQUE_INSTANCE_IDS+=("$id"); }
     done
     for id in "${UNIQUE_INSTANCE_IDS[@]}"; do
-      aws ec2 terminate-instances --region "$REGION" --instance-ids "$id" >/dev/null
+      aws ec2 terminate-instances --instance-ids "$id" >/dev/null
     done
     if ((${#UNIQUE_INSTANCE_IDS[@]} > 0)); then
-      aws ec2 wait instance-terminated --region "$REGION" --instance-ids "${UNIQUE_INSTANCE_IDS[@]}"
+      aws ec2 wait instance-terminated --instance-ids "${UNIQUE_INSTANCE_IDS[@]}"
     fi
 
     cleanup_failed=0
@@ -322,18 +299,18 @@ REMOTE_SERVE
       [[ -n "${SEEN[$volume_id]:-}" ]] || { SEEN[$volume_id]=1; UNIQUE_VOLUME_IDS+=("$volume_id"); }
     done
     for volume_id in "${UNIQUE_VOLUME_IDS[@]}"; do
-      volume_state="$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$volume_id" \
+      volume_state="$(aws ec2 describe-volumes --volume-ids "$volume_id" \
         --query 'Volumes[0].State' --output text 2>/dev/null || true)"
       if [[ -z "$volume_state" || "$volume_state" == "None" ]]; then
         continue
       fi
       deleted=0
       for attempt in $(seq 1 12); do
-        if aws ec2 delete-volume --region "$REGION" --volume-id "$volume_id" >/dev/null 2>&1; then
+        if aws ec2 delete-volume --volume-id "$volume_id" >/dev/null 2>&1; then
           deleted=1
           break
         fi
-        volume_state="$(aws ec2 describe-volumes --region "$REGION" --volume-ids "$volume_id" \
+        volume_state="$(aws ec2 describe-volumes --volume-ids "$volume_id" \
           --query 'Volumes[0].State' --output text 2>/dev/null || true)"
         if [[ -z "$volume_state" || "$volume_state" == "None" ]]; then
           deleted=1
@@ -355,7 +332,7 @@ REMOTE_SERVE
     for group_id in "${UNIQUE_SG_IDS[@]}"; do
       deleted=0
       for attempt in $(seq 1 12); do
-        if aws ec2 delete-security-group --region "$REGION" --group-id "$group_id" >/dev/null 2>&1; then
+        if aws ec2 delete-security-group --group-id "$group_id" >/dev/null 2>&1; then
           deleted=1
           break
         fi
@@ -367,19 +344,19 @@ REMOTE_SERVE
       fi
     done
 
-    if ! aws ec2 delete-key-pair --region "$REGION" --key-name "$KEY_NAME" >/dev/null 2>&1; then
+    if ! aws ec2 delete-key-pair --key-name "$KEY_NAME" >/dev/null 2>&1; then
       printf 'Could not delete key pair: %s\n' "$KEY_NAME" >&2
       cleanup_failed=1
     fi
 
-    REMAINING_INSTANCES="$(aws ec2 describe-instances --region "$REGION" \
+    REMAINING_INSTANCES="$(aws ec2 describe-instances \
       --filters "Name=tag:Project,Values=$PROJECT_TAG" \
         Name=instance-state-name,Values=pending,running,stopping,stopped \
       --query 'Reservations[].Instances[].InstanceId' --output text)"
-    REMAINING_VOLUMES="$(aws ec2 describe-volumes --region "$REGION" \
+    REMAINING_VOLUMES="$(aws ec2 describe-volumes \
       --filters "Name=tag:Project,Values=$PROJECT_TAG" \
       --query 'Volumes[].VolumeId' --output text)"
-    REMAINING_SGS="$(aws ec2 describe-security-groups --region "$REGION" \
+    REMAINING_SGS="$(aws ec2 describe-security-groups \
       --filters "Name=tag:Project,Values=$PROJECT_TAG" \
       --query 'SecurityGroups[].GroupId' --output text)"
     INSTANCE_REPORT="$REMAINING_INSTANCES"
@@ -407,5 +384,7 @@ REMOTE_SERVE
   *) usage ;;
 esac
 
-# Stage 6 output: raw JSON response from the private vLLM endpoint.
-# Stage 8 output on successful cleanup: (empty)
+# ---- results ----
+# Stage 6 output ($ bash opencsusm.sh 6):
+# {"id":"chatcmpl-caddb4996de54535a05dfd1ea5c0d35c","object":"chat.completion","created":1791774039,"model":"Qwen/Qwen2.5-0.5B-Instruct","choices":[{"index":0,"message":{"role":"assistant","content":"Hello John! It's nice to meet you. As a language model, I don't have personal","tool_calls":[]},"logprobs":null,"finish_reason":"length","stop_reason":null}],"usage":{"prompt_tokens":32,"total_tokens":52,"completion_tokens":20,"prompt_tokens_details":null},"prompt_logprobs":null}
+# Stage 8 output ($ bash opencsusm.sh 8): (empty)
